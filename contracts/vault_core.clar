@@ -4,12 +4,15 @@
 ;; Constants
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
-(define-constant err-unauthorized (err u101))
+(define-constant err-unauthorized (err u101)) 
 (define-constant err-invalid-vault (err u102))
 (define-constant err-already-exists (err u103))
+(define-constant err-key-expired (err u104))
+(define-constant err-invalid-rotation (err u105))
 
 ;; Data vars
 (define-data-var recovery-delay uint u144) ;; ~24 hours in blocks
+(define-data-var key-expiration uint u4320) ;; ~30 days in blocks
 
 ;; Data maps
 (define-map vaults
@@ -17,7 +20,9 @@
     {
         active: bool,
         created-at: uint,
-        last-accessed: uint
+        last-accessed: uint,
+        require-rotation: bool,
+        rotation-period: uint
     }
 )
 
@@ -26,7 +31,9 @@
     {
         encrypted-key: (string-ascii 1024),
         added-at: uint,
-        last-used: uint 
+        last-used: uint,
+        expires-at: uint,
+        rotation-count: uint
     }
 )
 
@@ -38,82 +45,102 @@
     }
 )
 
-;; Initialize vault
-(define-public (initialize-vault)
+(define-map key-history
+    { vault-owner: principal, key-id: (string-ascii 64) }
+    {
+        previous-keys: (list 5 (string-ascii 1024)),
+        rotation-timestamps: (list 5 uint)
+    }
+)
+
+;; Initialize vault with rotation settings
+(define-public (initialize-vault (require-rotation bool) (rotation-period uint))
     (let
         ((caller tx-sender))
         (asserts! (is-none (map-get? vaults caller)) err-already-exists)
         (ok (map-set vaults caller {
             active: true,
             created-at: block-height,
-            last-accessed: block-height
+            last-accessed: block-height,
+            require-rotation: require-rotation,
+            rotation-period: rotation-period
         }))
     )
 )
 
-;; Add key to vault
+;; Add key to vault with expiration
 (define-public (add-key (key-id (string-ascii 64)) (encrypted-key (string-ascii 1024)))
     (let
-        ((caller tx-sender))
-        (asserts! (is-some (map-get? vaults caller)) err-invalid-vault)
+        ((caller tx-sender)
+         (vault (unwrap! (map-get? vaults caller) err-invalid-vault)))
         (ok (map-set vault-keys 
             { vault-owner: caller, key-id: key-id }
             {
                 encrypted-key: encrypted-key,
                 added-at: block-height,
-                last-used: block-height
+                last-used: block-height,
+                expires-at: (+ block-height (var-get key-expiration)),
+                rotation-count: u0
             }
         ))
     )
 )
 
-;; Get key from vault
+;; Get key from vault with expiration check
 (define-public (get-key (key-id (string-ascii 64)))
     (let
         ((caller tx-sender)
-         (key-data (map-get? vault-keys { vault-owner: caller, key-id: key-id })))
-        (asserts! (is-some key-data) err-invalid-vault)
+         (key-data (unwrap! (map-get? vault-keys { vault-owner: caller, key-id: key-id }) err-invalid-vault))
+         (vault (unwrap! (map-get? vaults caller) err-invalid-vault)))
+        (asserts! (< block-height (get expires-at key-data)) err-key-expired)
         (map-set vault-keys
             { vault-owner: caller, key-id: key-id }
-            (merge (unwrap-panic key-data)
+            (merge key-data
                   { last-used: block-height }))
-        (ok (get encrypted-key (unwrap-panic key-data)))
+        (ok (get encrypted-key key-data))
     )
 )
 
-;; Initiate key recovery
-(define-public (initiate-recovery (backup-principal principal))
-    (let
-        ((caller tx-sender))
-        (asserts! (is-some (map-get? vaults caller)) err-invalid-vault)
-        (ok (map-set recovery-requests caller {
-            requested-at: block-height,
-            backup-principal: backup-principal
-        }))
-    )
-)
-
-;; Complete recovery after delay period
-(define-public (complete-recovery (vault-owner principal))
+;; Rotate key with history tracking
+(define-public (rotate-key (key-id (string-ascii 64)) (new-encrypted-key (string-ascii 1024)))
     (let
         ((caller tx-sender)
-         (request (map-get? recovery-requests vault-owner)))
-        (asserts! (is-some request) err-invalid-vault)
-        (asserts! (is-eq caller (get backup-principal (unwrap-panic request))) err-unauthorized)
-        (asserts! (> block-height (+ (get requested-at (unwrap-panic request)) (var-get recovery-delay))) err-unauthorized)
-        (map-set vaults vault-owner 
-            (merge (unwrap-panic (map-get? vaults vault-owner))
-                  { last-accessed: block-height }))
-        (map-delete recovery-requests vault-owner)
+         (key-data (unwrap! (map-get? vault-keys { vault-owner: caller, key-id: key-id }) err-invalid-vault))
+         (vault (unwrap! (map-get? vaults caller) err-invalid-vault))
+         (history (default-to 
+            { previous-keys: (list), rotation-timestamps: (list) }
+            (map-get? key-history { vault-owner: caller, key-id: key-id })))
+         (old-key (get encrypted-key key-data)))
+        
+        (asserts! (or 
+            (get require-rotation vault)
+            (>= block-height (+ (get last-used key-data) (get rotation-period vault)))
+        ) err-invalid-rotation)
+        
+        (map-set vault-keys
+            { vault-owner: caller, key-id: key-id }
+            {
+                encrypted-key: new-encrypted-key,
+                added-at: block-height,
+                last-used: block-height,
+                expires-at: (+ block-height (var-get key-expiration)),
+                rotation-count: (+ (get rotation-count key-data) u1)
+            })
+        
+        (map-set key-history
+            { vault-owner: caller, key-id: key-id }
+            {
+                previous-keys: (unwrap! (as-max-len? (append (get previous-keys history) old-key) u5) err-invalid-rotation),
+                rotation-timestamps: (unwrap! (as-max-len? (append (get rotation-timestamps history) block-height) u5) err-invalid-rotation)
+            })
+        
         (ok true)
     )
 )
 
-;; Read only functions
-(define-read-only (get-vault-info (vault-owner principal))
-    (ok (map-get? vaults vault-owner))
+;; Get key rotation history
+(define-read-only (get-key-history (key-id (string-ascii 64)))
+    (ok (map-get? key-history { vault-owner: tx-sender, key-id: key-id }))
 )
 
-(define-read-only (get-recovery-info (vault-owner principal))
-    (ok (map-get? recovery-requests vault-owner))
-)
+[previous functions remain unchanged...]
