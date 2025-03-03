@@ -12,8 +12,6 @@
 (define-constant err-invalid-period (err u106))
 (define-constant min-rotation-period u24) ;; Minimum 24 blocks for rotation
 
-[previous constants remain unchanged...]
-
 ;; Initialize vault with rotation settings
 (define-public (initialize-vault (require-rotation bool) (rotation-period uint))
     (let
@@ -30,14 +28,13 @@
     )
 )
 
-[previous functions remain unchanged...]
-
 ;; Get key rotation history
 (define-public (get-key-history (key-id (string-ascii 64)))
     (let
         ((caller tx-sender)
-         (history (map-get? key-history { vault-owner: caller, key-id: key-id })))
-        (asserts! (is-eq tx-sender caller) err-unauthorized)
-        (ok history)
+         (vault (map-get? vaults caller)))
+        ;; Check if vault exists first
+        (asserts! (is-some vault) err-invalid-vault)
+        (ok (map-get? key-history { vault-owner: caller, key-id: key-id }))
     )
 )
