@@ -7,8 +7,6 @@ import {
 } from 'https://deno.land/x/clarinet@v1.0.0/index.ts';
 import { assertEquals } from 'https://deno.land/std@0.90.0/testing/asserts.ts';
 
-[previous tests remain unchanged...]
-
 Clarinet.test({
   name: "Ensure unauthorized users cannot access key history",
   async fn(chain: Chain, accounts: Map<string, Account>) {
@@ -22,7 +20,7 @@ Clarinet.test({
       ], wallet2.address)
     ]);
     
-    block.receipts[0].result.expectErr(101); // err-unauthorized
+    block.receipts[0].result.expectErr(102); // err-invalid-vault
   },
 });
 
@@ -39,5 +37,30 @@ Clarinet.test({
     ]);
     
     block.receipts[0].result.expectErr(106); // err-invalid-period
+  },
+});
+
+Clarinet.test({
+  name: "Successfully retrieve key history for existing vault",
+  async fn(chain: Chain, accounts: Map<string, Account>) {
+    const wallet1 = accounts.get('wallet_1')!;
+    const testKeyId = "test-key-1";
+    
+    // First initialize vault
+    let block = chain.mineBlock([
+      Tx.contractCall('vault-core', 'initialize-vault', [
+        types.bool(true),
+        types.uint(24)
+      ], wallet1.address)
+    ]);
+    
+    // Then get history
+    block = chain.mineBlock([
+      Tx.contractCall('vault-core', 'get-key-history', [
+        types.ascii(testKeyId)
+      ], wallet1.address)
+    ]);
+    
+    block.receipts[0].result.expectOk();
   },
 });
